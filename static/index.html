@@ -10,45 +10,184 @@
 <body>
   <div id="app" class="shell">
     <header class="top">
-      <h1>抽取转换加载台</h1>
+      <h1>抽取转换加载台 · 分区落库与回溯窗</h1>
       <span class="who">{{ me }}</span>
       <button class="ghost" @click="logout">退出</button>
     </header>
-    <p class="muted">基线能力：管道列表、抽取、落库。后续题面在此叠加增量水位、清洗规则、并发争用等。</p>
+    <p class="muted">
+      分区写入由服务端裁决：同分区同刻只成一笔、空键失败、今日写入中禁回溯；
+      回溯策略本日锁死，重落手法漂移即判「回溯策略写歪了」。
+    </p>
+
+    <div class="toast" :class="toastKind" v-if="toast">{{ toast }}</div>
+
     <div class="board">
+      <!-- 左：管道总览 -->
       <section class="panel">
-        <h2>管道列表</h2>
+        <h2>管道总览</h2>
         <div v-if="!items.length" class="empty">暂无管道</div>
         <div
           v-for="p in items"
           :key="p.id"
-          class="row"
+          class="row pipe-row"
           :class="{ active: current && current.id === p.id }"
           @click="open(p.id)"
         >
           <div>
-            <div>{{ p.title }}</div>
+            <div class="pipe-title">{{ p.title }}</div>
             <div class="code">{{ p.code }} · {{ p.source_uri }}</div>
+            <div class="mini">
+              <span class="chip">分区 {{ p.partition_count || 0 }}</span>
+              <span class="chip ok" v-if="p.rewritten_count">已重写 {{ p.rewritten_count }}</span>
+              <span class="chip warn" v-if="p.writing_count">写入中 {{ p.writing_count }}</span>
+              <span class="chip">累计行 {{ p.total_rows || 0 }}</span>
+            </div>
           </div>
           <span class="tag" :class="tagClass(p.status)">{{ p.status }}</span>
         </div>
       </section>
-      <section class="panel">
-        <h2>管道详情</h2>
-        <div v-if="!current" class="empty">点左侧一条查看抽取与落库状态</div>
-        <template v-else>
-          <p class="kv"><b>题名</b>{{ current.title }}</p>
-          <p class="kv"><b>编码</b><span class="code">{{ current.code }}</span></p>
-          <p class="kv"><b>源地址</b><span class="code">{{ current.source_uri }}</span></p>
-          <p class="kv"><b>状态</b><span class="tag" :class="tagClass(current.status)">{{ current.status }}</span></p>
-          <p class="kv"><b>已抽取</b>{{ current.extracted }}</p>
-          <p class="kv"><b>已落库</b>{{ current.loaded }}</p>
-          <div class="actions">
-            <button @click="extract" :disabled="busy">执行抽取</button>
-            <button class="ghost" @click="load" :disabled="busy">执行落库</button>
+
+      <!-- 右：详情 + 分区 -->
+      <section class="panel" v-if="current">
+        <h2>{{ current.title }}</h2>
+        <p class="kv"><b>编码</b><span class="code">{{ current.code }}</span></p>
+        <p class="kv"><b>源地址</b><span class="code">{{ current.source_uri }}</span></p>
+        <p class="kv"><b>管道状态</b><span class="tag" :class="tagClass(current.status)">{{ current.status }}</span>
+          <span class="muted">已抽取 {{ current.extracted }} / 已落库 {{ current.loaded }}</span>
+        </p>
+        <div class="actions">
+          <button @click="extract" :disabled="busy">执行抽取</button>
+          <button class="ghost" @click="load" :disabled="busy">基线落库</button>
+          <button class="ghost" @click="refreshAll" :disabled="busy">刷新</button>
+        </div>
+
+        <div class="tabs">
+          <button :class="{ tabon: tab === 'board' }" @click="tab = 'board'">分区占用板</button>
+          <button :class="{ tabon: tab === 'events' }" @click="tab = 'events'">回溯详情</button>
+          <button :class="{ tabon: tab === 'policy' }" @click="tab = 'policy'">回溯设置</button>
+        </div>
+
+        <!-- 占用板 -->
+        <div v-if="tab === 'board'">
+          <div class="write-box">
+            <h3>分区落库（服务端裁决）</h3>
+            <label class="flabel">分区键（日期建议 YYYY-MM-DD，空键必败）
+              <input v-model="form.partition_key" placeholder="如 2026-11-10" />
+            </label>
+            <div class="grid2">
+              <label class="flabel">落库手法
+                <select v-model="form.method">
+                  <option value="direct">直接重落</option>
+                  <option value="clear_first">清空再写（整分区先清空）</option>
+                </select>
+              </label>
+              <label class="flabel">写入人
+                <input v-model="form.writer" placeholder="默认 admin" />
+              </label>
+            </div>
+            <label class="flabel">行数（留空由服务端裁定）
+              <input v-model.number="form.row_count" type="number" min="1" placeholder="自动" />
+            </label>
+            <div class="actions">
+              <button @click="oneShot" :disabled="busy">一键落库</button>
+              <button class="ghost" @click="begin" :disabled="busy">开始写入（两阶段）</button>
+              <template v-if="openWrite">
+                <button @click="commit" :disabled="busy">提交写入</button>
+                <button class="ghost danger" @click="rollback" :disabled="busy">回滚</button>
+                <span class="muted">开放写入单 #{{ openWrite.write_id }} · {{ openWrite.partition_key }}</span>
+              </template>
+            </div>
           </div>
-          <p v-if="msg" class="muted">{{ msg }}</p>
-        </template>
+
+          <h3>占用板（窗内 / 窗外）</h3>
+          <div v-if="!overview.partitions.length" class="empty">还没有任何分区落库</div>
+          <table v-else class="ptable">
+            <thead>
+              <tr><th>分区键</th><th>行数</th><th>是否在窗内</th><th>策略名</th><th>状态</th><th>重写</th><th>写入人</th></tr>
+            </thead>
+            <tbody>
+              <tr v-for="p in overview.partitions" :key="p.id" class="prow" @click="openPartition(p.id)">
+                <td class="code">{{ p.partition_key }}</td>
+                <td>{{ p.row_count }}</td>
+                <td>
+                  <span class="tag" :class="p.in_window ? 'ok' : 'out'">
+                    {{ p.in_window ? '窗内' : '窗外' }}
+                  </span>
+                </td>
+                <td>{{ p.policy_name || '—' }}</td>
+                <td>
+                  <span class="tag" :class="p.status === '写入中' ? 'warn' : 'ok'">{{ p.status }}</span>
+                </td>
+                <td>{{ p.writes_count }} 笔</td>
+                <td>{{ p.last_writer || '—' }}</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+
+        <!-- 回溯详情 -->
+        <div v-if="tab === 'events'">
+          <div v-if="partitionDetail" class="detail-box">
+            <div class="detail-head">
+              <h3>分区 {{ partitionDetail.partition_key }} 详情</h3>
+              <button class="ghost" @click="partitionDetail = null">关闭</button>
+            </div>
+            <p class="kv"><b>行数</b>{{ partitionDetail.row_count }}</p>
+            <p class="kv"><b>占用状态</b>{{ partitionDetail.status }} · 累计写入 {{ partitionDetail.writes_count }} 笔</p>
+          </div>
+          <h3>清空 / 拒绝原因与抢占记录</h3>
+          <div v-if="!overview.events.length" class="empty">尚无回溯事件</div>
+          <table v-else class="ptable">
+            <thead>
+              <tr><th>时间</th><th>分区键</th><th>事件</th><th>类型</th><th>手法</th><th>写入人</th><th>行数</th><th>原因 / 说明</th></tr>
+            </thead>
+            <tbody>
+              <tr v-for="e in overview.events" :key="e.id" :class="eventRowClass(e)">
+                <td class="code">{{ e.created_at }}</td>
+                <td class="code">{{ e.partition_key }}</td>
+                <td><span class="tag" :class="eventTagClass(e)">{{ e.event }}</span></td>
+                <td>{{ e.kind === 'backfill' ? '回溯重落' : '首次落库' }}</td>
+                <td>{{ e.method_label }}</td>
+                <td>{{ e.writer }}</td>
+                <td>{{ e.row_count ?? '—' }}</td>
+                <td class="reason">{{ e.reason || '—' }}</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+
+        <!-- 回溯设置 -->
+        <div v-if="tab === 'policy'">
+          <div class="write-box">
+            <h3>回溯策略（选定后本日锁死，次日可改）</h3>
+            <div v-if="overview.policy" class="lock-banner" :class="overview.policy_locked_today ? 'locked' : ''">
+              当前策略：<b>{{ overview.policy.policy_name }}</b>
+              <span v-if="overview.policy.window_days">· 钉死天数 {{ overview.policy.window_days }} 天</span>
+              · 锁定于 {{ overview.policy.locked_at }}
+              <span v-if="overview.policy_locked_today" class="lock-tag">本日锁死</span>
+            </div>
+            <label class="flabel">策略
+              <select v-model="policyForm.strategy" :disabled="overview.policy_locked_today">
+                <option value="fixed_days">固定窗重落：只允许重落最近固定天数的分区</option>
+                <option value="clear_first">先清空再写：任意历史分区须整分区清空后再写</option>
+              </select>
+            </label>
+            <label class="flabel" v-if="policyForm.strategy === 'fixed_days'">钉死窗内天数（正整数）
+              <input v-model.number="policyForm.window_days" type="number" min="1"
+                     :disabled="overview.policy_locked_today" />
+            </label>
+            <div class="actions">
+              <button @click="savePolicy" :disabled="busy || overview.policy_locked_today">写入并本日锁死</button>
+            </div>
+            <p class="muted">
+              固定窗：窗外分区重落将被拒绝；清空再写：直接重落手法漂移，服务端判「回溯策略写歪了」。
+            </p>
+          </div>
+        </div>
+      </section>
+
+      <section class="panel" v-else>
+        <div class="empty">点左侧一条管道，查看占用板、回溯详情与回溯设置</div>
       </section>
     </div>
   </div>
